@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -93,6 +94,22 @@ func (a *KitAgent) Start(ctx context.Context) error {
 		SessionDir: a.workDir,
 		Quiet:      true,
 		SkipConfig: true, // Hermetic: ignore ~/.kit.yml so iteratr behaves consistently
+	}
+
+	// Forward provider overrides from iteratr's own env vars. iteratr uses
+	// SkipConfig: true, which also bypasses viper's env-var setup, so KIT_*
+	// env vars are not auto-read. Read them here and pass through Options.
+	// Precedence: ITERATR_PROVIDER_URL > KIT_PROVIDER_URL (so users can
+	// override KIT's default by being explicit with the iteratr-prefixed var).
+	if v := os.Getenv("ITERATR_PROVIDER_URL"); v != "" {
+		opts.ProviderURL = v
+	} else if v := os.Getenv("KIT_PROVIDER_URL"); v != "" {
+		opts.ProviderURL = v
+	}
+	if v := os.Getenv("ITERATR_PROVIDER_API_KEY"); v != "" {
+		opts.ProviderAPIKey = v
+	} else if v := os.Getenv("KIT_PROVIDER_API_KEY"); v != "" {
+		opts.ProviderAPIKey = v
 	}
 
 	// Configure MCP server if URL provided.

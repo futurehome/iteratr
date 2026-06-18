@@ -147,6 +147,8 @@ type ModelSelectorStep struct {
 	scrollList      *tui.ScrollList // Lazy-rendering scroll list for filtered models
 	selectedIdx     int             // Index in filtered list (skips headers)
 	searchInput     textinput.Model // Fuzzy search input
+	customInput     textinput.Model // Custom model entry input (press 'c' to enter)
+	isCustomMode    bool            // True when in custom model entry mode
 	loading         bool            // Whether models are being fetched
 	error           string          // Error message if fetch failed
 	isNotInstalled  bool            // True if opencode is not installed
@@ -185,6 +187,13 @@ func NewModelSelectorStep() *ModelSelectorStep {
 	input.SetStyles(styles)
 	input.SetWidth(50)
 
+	// Initialize custom model input (press 'c' to enter)
+	customInput := textinput.New()
+	customInput.Placeholder = "e.g., custom/qwen3_5-122b"
+	customInput.Prompt = "Model ID: "
+	customInput.SetStyles(styles)
+	customInput.SetWidth(50)
+
 	// Initialize spinner
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -201,13 +210,14 @@ func NewModelSelectorStep() *ModelSelectorStep {
 	}
 
 	return &ModelSelectorStep{
-		searchInput:   input,
-		scrollList:    scrollList,
-		spinner:       s,
-		loading:       true,
-		selectedIdx:   0,
-		width:         60,
-		height:        10,
+		searchInput:  input,
+		customInput:  customInput,
+		scrollList:   scrollList,
+		spinner:      s,
+		loading:      true,
+		selectedIdx:  0,
+		width:        60,
+		height:       10,
 		activeModelID: activeModel,
 	}
 }
@@ -643,7 +653,39 @@ func (m *ModelSelectorStep) Update(msg tea.Msg) tea.Cmd {
 
 	// Handle keyboard input
 	if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
+		// In custom mode, handle differently
+		if m.isCustomMode {
+			switch keyMsg.String() {
+			case "enter":
+				customModel := strings.TrimSpace(m.customInput.Value())
+				if customModel != "" {
+					return func() tea.Msg {
+						return ModelSelectedMsg{ModelID: customModel}
+					}
+				}
+				return nil
+			case "esc":
+				m.isCustomMode = false
+				m.customInput.SetValue("")
+				m.customInput.Blur()
+				m.searchInput.Focus()
+				return func() tea.Msg { return ContentChangedMsg{} }
+			}
+
+			var cmd tea.Cmd
+			m.customInput, cmd = m.customInput.Update(msg)
+			cmds = append(cmds, cmd)
+			return tea.Batch(cmds...)
+		}
+
 		switch keyMsg.String() {
+		case "c":
+			m.isCustomMode = true
+			m.searchInput.Blur()
+			cmds = append(cmds, m.customInput.Focus())
+			cmds = append(cmds, func() tea.Msg { return ContentChangedMsg{} })
+			return tea.Batch(cmds...)
+
 		case "up", "k":
 			m.moveSelection(-1)
 			return nil
@@ -685,6 +727,18 @@ func (m *ModelSelectorStep) View() string {
 	if m.loading {
 		b.WriteString(m.spinner.View())
 		b.WriteString(" Loading models...\n")
+		return b.String()
+	}
+
+	// Custom model entry mode (entered by pressing 'c')
+	if m.isCustomMode {
+		titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#b4befe")).Bold(true)
+		b.WriteString(titleStyle.Render("Enter Custom Model"))
+		b.WriteString("\n\n")
+		b.WriteString(m.customInput.View())
+		b.WriteString("\n\n")
+		hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#a6adc8"))
+		b.WriteString(hintStyle.Render("Enter confirm • ESC cancel"))
 		return b.String()
 	}
 
@@ -747,7 +801,7 @@ func (m *ModelSelectorStep) View() string {
 		"type", "filter",
 		"↑↓/j/k", "navigate",
 		"enter", "select",
-		"tab", "buttons",
+		"c", "custom",
 		"esc", "back",
 	)
 	b.WriteString(hintBar)
@@ -782,11 +836,16 @@ type ModelSelectedMsg struct {
 	ModelID string
 }
 
-// Cursor returns the cursor from the search input.
-// The search input is the first line rendered in View, so no Y offset needed.
+// Cursor returns the cursor from the active text input.
+// Returns nil while loading or on error. In custom mode the cursor comes
+// from the custom input; otherwise from the search input. Both render at
+// the top of the View, so no Y offset is needed.
 func (m *ModelSelectorStep) Cursor() *tea.Cursor {
 	if m.loading || m.error != "" {
 		return nil
+	}
+	if m.isCustomMode {
+		return m.customInput.Cursor()
 	}
 	return m.searchInput.Cursor()
 }
@@ -808,6 +867,12 @@ func (m *ModelSelectorStep) PreferredHeight() int {
 		}
 		// Error + blank + hint bar = 3 lines
 		return 3
+	}
+
+	// For custom model entry mode (compact, fixed height)
+	if m.isCustomMode {
+		// Title + blank + input + blank + hint = 5 lines
+		return 5
 	}
 
 	// For normal state:

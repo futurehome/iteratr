@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +95,8 @@ func (a *KitAgent) Start(ctx context.Context) error {
 		Quiet:      true,
 		SkipConfig: true, // Hermetic: ignore ~/.kit.yml so iteratr behaves consistently
 	}
+
+	applyProviderEnvOverrides(opts)
 
 	// Configure MCP server if URL provided.
 	// Use top-level Options.MCPConfig — Options.CLI is reserved for the
@@ -553,5 +556,32 @@ func mapStopReason(kitReason string) string {
 		return "end_turn"
 	default:
 		return kitReason
+	}
+}
+
+// applyProviderEnvOverrides forwards provider overrides from iteratr's own
+// env vars into the given kit.Options. iteratr uses SkipConfig: true, which
+// also bypasses viper's env-var setup, so KIT_* env vars are not auto-read
+// even when set in the shell. Reading them here and pushing them through
+// Options is the only way to make custom OpenAI-compatible endpoints
+// (used with the `custom/<model>` prefix) work.
+//
+// Precedence: ITERATR_PROVIDER_URL > KIT_PROVIDER_URL (and same for the
+// API key), so the iteratr-prefixed name wins when both are set. Empty
+// env vars are treated as "unset" and any pre-existing value on opts is
+// preserved.
+func applyProviderEnvOverrides(opts *kit.Options) {
+	if opts == nil {
+		return
+	}
+	if v := os.Getenv("ITERATR_PROVIDER_URL"); v != "" {
+		opts.ProviderURL = v
+	} else if v := os.Getenv("KIT_PROVIDER_URL"); v != "" {
+		opts.ProviderURL = v
+	}
+	if v := os.Getenv("ITERATR_PROVIDER_API_KEY"); v != "" {
+		opts.ProviderAPIKey = v
+	} else if v := os.Getenv("KIT_PROVIDER_API_KEY"); v != "" {
+		opts.ProviderAPIKey = v
 	}
 }

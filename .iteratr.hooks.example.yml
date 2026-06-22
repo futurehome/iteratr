@@ -1,8 +1,30 @@
 # iteratr Hooks Configuration Example
 # Save as .iteratr.hooks.yml in your working directory
+#
+# Two patterns are shown below:
+#   (A) Per-event independent commands  — the default, simple, no shared state
+#   (B) Shared tmux session              — one persistent bash across every
+#                                         iteration; env vars, cwd, shell
+#                                         functions, and computed values all
+#                                         persist
+#
+# Pick the pattern that matches what you're doing. Most users start with (A)
+# and graduate to (B) when they need state to carry across hooks (e.g.,
+# activate a venv in session_start and have it still active in
+# post_iteration).
+#
+# Both patterns use only iteratr's existing template variables
+# ({{session}}, {{iteration}}, {{task_id}}, {{task_content}}, {{error}}).
+# Pattern (B) additionally requires the `tmux` binary on PATH.
 
 version: 1
 
+# ----------------------------------------------------------------------
+# (A) Per-event independent commands  — the default
+# ----------------------------------------------------------------------
+# Each entry runs in its own `sh -c` invocation. State does NOT cross
+# entries; use temp files if you need to pass values from one hook to
+# another. This is the right pattern when each hook is self-contained.
 hooks:
   # session_start: Run once at session start, before first iteration
   # Use for: Setup tasks, pulling latest code, verifying dependencies
@@ -10,23 +32,22 @@ hooks:
     - command: "git pull --rebase"
       timeout: 30
       # pipe_output: false (default) - just run silently
-    
+
     - command: "go build ./..."
       timeout: 60
       pipe_output: true  # Send build errors to agent in first iteration
 
   # pre_iteration: Run before each iteration
   # Use for: Linting, static analysis, up-to-date context
-  # BREAKING CHANGE: Now requires explicit pipe_output: true
   pre_iteration:
     - command: "golangci-lint run ./..."
       timeout: 30
       pipe_output: true  # Agent sees lint errors and can fix them
-    
+
     - command: "git status --short"
       timeout: 5
       pipe_output: true  # Agent sees current changes
-    
+
     - command: "go vet ./..."
       timeout: 10
       pipe_output: true
@@ -38,66 +59,207 @@ hooks:
     - command: "go test ./... -short"
       timeout: 120
       pipe_output: true  # Agent sees test failures next iteration
-    
+
     - command: "go build ./..."
       timeout: 60
       pipe_output: true  # Agent sees build errors next iteration
-    
+
     - command: 'curl -X POST $SLACK_WEBHOOK -d "{\"text\": \"Iteration {{iteration}} done\"}"'
       timeout: 5
       # pipe_output: false (default) - just send notification
 
   # session_end: Run once after session completes (after final delivery)
   # Use for: Cleanup, notifications, final builds
-  # pipe_output is ignored (no more iterations)
   session_end:
     - command: "git push origin HEAD"
       timeout: 30
-    
+
     - command: "./scripts/notify-complete.sh {{session}}"
       timeout: 10
 
   # on_task_complete: Run when any task is marked completed
-  # Use for: Task validation, per-task builds/tests
-  # Subscribes to NATS task events, output piped to next iteration
   on_task_complete:
     - command: "./scripts/validate-task.sh {{task_id}}"
       timeout: 30
-      pipe_output: true  # Agent sees validation results
-    
+      pipe_output: true
+
     - command: 'echo "Task {{task_id}} completed: {{task_content}}"'
       timeout: 5
-      # pipe_output: false (default) - just log
 
-  # on_error: Run when iteration fails (agent error, network error, etc.)
-  # Use for: Diagnostics, state dumps
-  # Output sent immediately in recovery prompt, then continues to next iteration
+  # on_error: Run when iteration fails
   on_error:
     - command: "git diff HEAD"
       timeout: 10
-      pipe_output: true  # Show agent what changed before error
-    
+      pipe_output: true
+
     - command: "git status --short"
       timeout: 5
       pipe_output: true
-    
+
     - command: 'echo "Error in iteration {{iteration}}: {{error}}"'
       timeout: 5
-      # pipe_output: false (default) - just log
 
+# ----------------------------------------------------------------------
+# (B) Shared tmux session  — opt-in via the `tmux_session:` field
+# ----------------------------------------------------------------------
+# All hooks in this config share ONE persistent bash process running
+# inside a tmux session. State (env vars, cwd, shell functions, aliases,
+# computed values) persists across every hook event AND every iteratr
+# run, because they all talk to the same long-lived shell.
+#
+# Set `tmux_session: <name>` at the top level. iteratr will:
+#   - Create the session on first hook if it doesn't exist
+#   - Reuse it for every subsequent hook
+#   - Leave it alive after iteratr exits (you can `tmux attach` later)
+#   - Reuse it across multiple iteratr runs
+#
+# The example below uses the same hook events as pattern (A) but writes
+# each command into the shared shell via `tmux send-keys`. State set in
+# session_start (venv activation, env vars, function defs) is visible in
+# every later hook.
+#
+# Pattern in each hook:
+#   1. wait-for -U clears any stale done signal
+#   2. send-keys sends "<your work>; tmux wait-for -S $CH" into the shell
+#   3. wait-for $CH blocks until the command finishes
+#   4. capture-pane -p grabs the output (last 50 lines here)
+#
+# Requires: `tmux` binary on PATH. iteratr does NOT fall back — if tmux
+# is missing, hooks in this config will fail. Add a check at the top of
+# session_start if you need a graceful fallback.
+#
+# To inspect what's happening in real time:
+#   tmux attach -t iteratr-shared      # Ctrl-B D to detach
+hooks_b:
+  tmux_session: "iteratr-shared"
+  session_start:
+    - command: |
+        S=iteratr-shared
+        # Idempotent session creation. Skip if it already exists.
+        if ! tmux has-session -t "$S" 2>/dev/null; then
+          tmux new-session -d -s "$S" -x 200 -y 50 \
+            'bash --norc --noprofile'
+          echo "[hooks] created shared tmux session '$S'"
+        else
+          echo "[hooks] reusing existing tmux session '$S'"
+        fi
+        # Establish the sync channel name. Hooks wait for this and signal
+        # it when their work is done.
+        tmux set-environment -t "$S" ITERATR_HOOK_DONE iteratr-shared-done
+      timeout: 5
+
+    # One-time setup that benefits from the shared shell. Anything
+    # exported / sourced / cd'd here is visible to every later hook
+    # because they're all the same shell.
+    - command: |
+        S=iteratr-shared
+        CH=iteratr-shared-done
+        tmux wait-for -U "$CH" 2>/dev/null || true
+        tmux send-keys -t "$S" \
+          "export ITERATR_SESSION='{{session}}'; \
+           export WORKDIR='{{workdir}}'; \
+           # e.g. source ./scripts/iteratr-env.sh to activate a venv; \
+           echo \"iteratr-shared shell ready in \$PWD\"; \
+           tmux wait-for -S \"$CH\"" Enter
+        tmux wait-for "$CH"
+      timeout: 30
+
+  pre_iteration:
+    - command: |
+        S=iteratr-shared
+        CH=iteratr-shared-done
+        tmux wait-for -U "$CH" 2>/dev/null || true
+        tmux send-keys -t "$S" \
+          "ITERATION={{iteration}}; export ITERATION; \
+           cd '$WORKDIR' 2>/dev/null; \
+           date +%s > /tmp/iteratr-iter-{{iteration}}-start; \
+           tmux wait-for -S \"$CH\"" Enter
+        tmux wait-for "$CH"
+        tmux capture-pane -p -t "$S" -S -50
+      timeout: 10
+
+  post_iteration:
+    - command: |
+        S=iteratr-shared
+        CH=iteratr-shared-done
+        tmux wait-for -U "$CH" 2>/dev/null || true
+        # Reads the start time written by pre_iteration — proves state
+        # (cwd, env vars, files) all persisted across the iteration.
+        tmux send-keys -t "$S" \
+          "START=\$(cat /tmp/iteratr-iter-{{iteration}}-start); \
+           END=\$(date +%s); \
+           echo \"iteration {{iteration}} took \$((END-START))s\"; \
+           # do_post_iteration_work that uses \$ITERATR_SESSION / \$WORKDIR; \
+           tmux wait-for -S \"$CH\"" Enter
+        tmux wait-for "$CH"
+        tmux capture-pane -p -t "$S" -S -50
+      timeout: 30
+
+  on_task_complete:
+    - command: |
+        S=iteratr-shared
+        CH=iteratr-shared-done
+        tmux wait-for -U "$CH" 2>/dev/null || true
+        tmux send-keys -t "$S" \
+          "echo \"task {{task_id}} complete in $PWD\"; \
+           tmux wait-for -S \"$CH\"" Enter
+        tmux wait-for "$CH"
+        tmux capture-pane -p -t "$S" -S -50
+      timeout: 10
+
+  on_error:
+    - command: |
+        S=iteratr-shared
+        CH=iteratr-shared-done
+        tmux wait-for -U "$CH" 2>/dev/null || true
+        tmux send-keys -t "$S" \
+          "echo \"error in iteration {{iteration}}: {{error}}\" >&2; \
+           tmux wait-for -S \"$CH\"" Enter
+        tmux wait-for "$CH"
+        tmux capture-pane -p -t "$S" -S -50
+      timeout: 5
+
+  # NOTE: no session_end entry. The shared session is intentionally
+  # left alive so you can `tmux attach -t iteratr-shared` and inspect
+  # state after the run. To clean it up manually:
+  #   tmux kill-session -t iteratr-shared
+
+# ----------------------------------------------------------------------
+# State-sharing cheat sheet
+# ----------------------------------------------------------------------
+# Pattern (A): each command is a fresh shell. State crosses entries
+# only via files on disk. Within one event, all commands are
+# independent — failing one doesn't stop the next.
+#
+# Pattern (B): all entries share one bash process inside tmux. State
+# crosses entries freely: env vars, cwd, shell functions, aliases,
+# shell variables, history, etc. Within one event, all commands run
+# sequentially in the same shell, so failing one doesn't stop the
+# next (unless you use `set -e`).
+#
+# Both patterns are fully backward-compatible with each other. You can
+# switch from (A) to (B) by adding `tmux_session:` and changing the
+# command bodies, without touching anything else.
+
+# ----------------------------------------------------------------------
 # Template Variables Available:
-# {{session}} - Session name (all hooks)
-# {{iteration}} - Current iteration number (pre_iteration, post_iteration, on_error)
-# {{task_id}} - Task ID (on_task_complete)
+# ----------------------------------------------------------------------
+# {{session}}      - Session name (all hooks)
+# {{iteration}}    - Current iteration number (pre_iteration, post_iteration, on_error)
+# {{task_id}}      - Task ID (on_task_complete)
 # {{task_content}} - Task content text (on_task_complete)
-# {{error}} - Error message (on_error)
+# {{error}}        - Error message (on_error)
 
+# ----------------------------------------------------------------------
 # Timeout:
+# ----------------------------------------------------------------------
 # - Defaults to 30 seconds if not specified
 # - Commands killed after timeout
 # - Partial output included with timeout error message
 
+# ----------------------------------------------------------------------
 # Error Handling:
+# ----------------------------------------------------------------------
 # - Hook failures never fail the session
 # - Errors logged and included in output
 # - Context cancellation propagates properly
